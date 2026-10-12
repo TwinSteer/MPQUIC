@@ -1,0 +1,746 @@
+--- a/sender/sender_dqn.cpp
++++ b/sender/sender.cpp
+@@ -1,18 +1,9 @@
+ /*
+- * Sender final - based directly on the supplied original sender.
++ * TwinSteer MP-QUIC reference sender.
+  *
+- * Added only:
+- *   1) Sirius local gpsd( localhost:2947 ) GPS thread
+- *   2) heading + gps_fixed in FrameMetaPacket
+- *   3) RTP packet sequence/frame_id/Tx timestamp envelope
+- *   4) DQN scheduler client (dqn_client.hpp <-> dqn_infer.py)
+- *   5) [터미널] 1초 주기 상태 블록 + 이벤트 로그   ← 이번 수정
+- *
+- * IMPORTANT:
+- *   The receiver must strip RtpPacketEnvelope before RTP decoding.
+- *
+- * NOTE: CSV 로깅 코드는 원본 그대로다. 화면 출력만 바뀌었다.
+- *       추가 헤더 파일 없음 — 출력 유틸은 이 파일 안에 들어있다.
++ * The public reference implementation intentionally uses a single
++ * round-robin packet scheduler over the available Uu and PC5 paths.
++ * TwinSteer learning/DQN components are maintained separately.
+  */
+ #include <cstdio>
+ #include <cstdlib>
+@@ -74,7 +65,6 @@
+ #include <gst/gst.h>
+ #include <gst/app/gstappsrc.h>
+ #include <gst/app/gstappsink.h>
+-#include "dqn_client.hpp"
+ 
+ // ═════════════════════════════════════════════════════════════
+ //  터미널 출력 유틸 (화면 전용 — CSV 와 무관)
+@@ -223,8 +213,7 @@
+ std::mutex quic_mutex;
+ static picoquic_cnx_t* g_cnx = nullptr;
+ 
+-static int g_selected_scheduler = SCHEDULER_MIN_RTT;
+-static const char* g_scheduler_name = "minrtt";
++static const uint8_t RR_SCHEDULER_ID = 0;
+ static const char* g_exp_name = "default";
+ 
+ static GstAppSrc*  g_appsrc  = nullptr;
+@@ -249,18 +238,22 @@
+ 
+ static std::atomic<int>      g_uu_rssi_snapshot{0};
+ static std::atomic<int>      g_pc5_rssi_snapshot{0};
+-static std::atomic<uint64_t> g_dispatch_seq{0};
+-
+-static FILE*      g_dqn_csv = nullptr;
+-static std::mutex g_dqn_csv_mtx;
+-
+-#define PC5_SENDER_IP    "10.254.52.19"   // 이름표. 임의값
+-#define PC5_RECEIVER_IP  "10.254.52.18"   // 이름표. scheduler.c 와 일치
+-#define UU_RECEIVER_IP   "100.73.62.97"
+-#define UU_RECEIVER_PORT 36230
+-#define UU_SENDER_IP     "0.0.0.0"
+-#define UU_SENDER_PORT   0
+-#define UU_INTERFACE     "enp3s0"
++static char g_pc5_sender_ip[64]   = "10.254.52.19";
++static char g_pc5_receiver_ip[64] = "10.254.52.18";
++static char g_uu_receiver_ip[64]  = "100.73.62.97";
++static int  g_uu_receiver_port    = 36230;
++static char g_uu_sender_ip[64]    = "0.0.0.0";
++static int  g_uu_sender_port      = 0;
++static char g_gps_host[64]        = "192.168.70.102";
++static char g_gps_port[16]        = "4545";
++static int  g_camera_index        = 0;
++
++#define PC5_SENDER_IP    g_pc5_sender_ip
++#define PC5_RECEIVER_IP  g_pc5_receiver_ip
++#define UU_RECEIVER_IP   g_uu_receiver_ip
++#define UU_RECEIVER_PORT g_uu_receiver_port
++#define UU_SENDER_IP     g_uu_sender_ip
++#define UU_SENDER_PORT   g_uu_sender_port
+ 
+ struct sockaddr_storage pc5_remote_addr;
+ struct sockaddr_storage pc5_local_addr;
+@@ -286,16 +279,8 @@
+ static std::atomic<bool> g_pc5_path_added(false);
+ static std::atomic<bool> g_pc5_need_probe(false);
+ 
+-// ── [제거됨] 커스텀 0xEE Ping/Pong ──────────────────────────
+-//   draft-ietf-quic-multipath-21 §3.3 / §5.9 는 유휴 경로의 생존
+-//   확인과 keepalive 에 QUIC PING 같은 ack-eliciting 패킷을 쓰라고
+-//   권고한다. 커스텀 ping 은 QUIC 을 우회하므로
+-//     - PATH_ACK 을 유발하지 못해 §5.4 의 RTT 산출에 기여하지 못하고
+-//     - 손실 감지/PTO/demotion 어디에도 반영되지 않으며
+-//     - smoothed_rtt 를 직접 덮어쓰는 해킹을 부른다(§5.7 PTO 계산 파손)
+-//   대신 pathKeepaliveThread 가 주기적으로 유휴 경로에 실제 QUIC
+-//   패킷을 한 개 흘려보내고, 생존 판정은 picoquic 에게 맡긴다.
+-//   RTT 는 picoquic 이 계산한 path->smoothed_rtt 를 그대로 읽는다.
++// QUIC path liveness and RTT are taken from picoquic's own path state.
++// The reference sender does not inject custom RTT samples.
+ 
+ static inline uint64_t now_us() {
+     struct timeval tv; gettimeofday(&tv, nullptr);
+@@ -324,14 +309,6 @@
+ static scheduler_path_info_t  g_pinfo_pc5 = {};
+ static std::atomic<uint64_t>  g_pinfo_at_us{0};
+ 
+-// ── keepalive (draft-21 §5.9) ────────────────────────────────
+-static std::atomic<uint64_t> g_ka_uu{0};     // Uu  로 보낸 keepalive 횟수
+-static std::atomic<uint64_t> g_ka_pc5{0};    // PC5 로 보낸 keepalive 횟수
+-
+-// ── Uu 인위적 차단 (PC5 단독 생존 검증용, --kill-uu <초>) ────
+-static std::atomic<bool>     g_uu_killed{false};
+-static int                   g_kill_uu_after_s = 0;
+-
+ static std::atomic<uint64_t> g_enc_bytes{0};
+ static std::atomic<double>   g_cam_fps{0.0};
+ static std::atomic<uint64_t> g_cam_drop{0};
+@@ -339,35 +316,6 @@
+ static std::atomic<int> g_probe_ok{0};
+ static std::atomic<int> g_probe_fail{0};
+ 
+-static std::atomic<int> g_pc5_delay_us{0};   // --pc5-delay <ms>
+-
+-// ── [DQN] delivery_ratio 집계 ────────────────────────────────
+-//   결정 주기(기본 500ms)마다 호출되며, 그 사이 구간의
+-//   재전송 비율로부터 전달률을 근사한다.
+-//     delivery_ratio = 1 - (구간 재전송 수 / 구간 송신 패킷 수)
+-//   nb_retransmission_total 은 커넥션 전체 누적값이므로
+-//   분모도 경로 구분 없이 전체 송신 패킷 수를 쓴다.
+-static std::atomic<uint64_t> g_win_sent{0};
+-static std::atomic<uint64_t> g_win_retx_base{0};
+-
+-static double dqn_delivery_ratio() {
+-    uint64_t sent = g_win_sent.exchange(0);
+-    if (sent == 0) return 1.0;
+-
+-    uint64_t retx_now = 0;
+-    {
+-        std::lock_guard<std::mutex> lk(quic_mutex);
+-        if (g_cnx) retx_now = (uint64_t)g_cnx->nb_retransmission_total;
+-    }
+-    uint64_t base = g_win_retx_base.exchange(retx_now);
+-    uint64_t retx = (retx_now > base) ? (retx_now - base) : 0;
+-
+-    double r = 1.0 - (double)retx / (double)sent;
+-    if (r < 0.0) r = 0.0;
+-    if (r > 1.0) r = 1.0;
+-    return r;
+-}
+-
+ // ===================== 함수 =====================
+ 
+ void sendTypedData(uint8_t type, const uint8_t* data, uint32_t len) {
+@@ -375,26 +323,11 @@
+     std::lock_guard<std::mutex> lock(quic_mutex);
+     if (!g_cnx) return;
+ 
+-    if (!scheduler_is_redundant()) {
+-        picoquic_add_to_stream(g_cnx, 4, &type, 1, 0);
+-        picoquic_add_to_stream(g_cnx, 4, (const uint8_t*)&net_len, 4, 0);
+-        picoquic_add_to_stream(g_cnx, 4, data, len, 0);
+-        return;
+-    }
+-    // Redundant: stream4(Uu) + stream8(PC5)
++    /* A single QUIC stream is used. Packet-level path selection is handled
++     * by the round-robin scheduler inside picoquic. */
+     picoquic_add_to_stream(g_cnx, 4, &type, 1, 0);
+     picoquic_add_to_stream(g_cnx, 4, (const uint8_t*)&net_len, 4, 0);
+     picoquic_add_to_stream(g_cnx, 4, data, len, 0);
+-    picoquic_add_to_stream(g_cnx, 8, &type, 1, 0);
+-    picoquic_add_to_stream(g_cnx, 8, (const uint8_t*)&net_len, 4, 0);
+-    picoquic_add_to_stream(g_cnx, 8, data, len, 0);
+-
+-    if (g_cnx->nb_paths >= 2) {
+-        int pc5_idx = scheduler_find_pc5_path_idx(g_cnx, PC5_RECEIVER_IP);
+-        if (pc5_idx >= 0)
+-            scheduler_set_stream_path_affinity(g_cnx, REDUNDANT_SECONDARY_STREAM,
+-                                               g_cnx->path[pc5_idx]);
+-    }
+ }
+ 
+ void sendFrameMeta(uint64_t frameId) {
+@@ -402,7 +335,7 @@
+     memset(&meta, 0, sizeof(meta));
+     meta.frame_id     = frameId;
+     meta.t_tx_us      = now_us();
+-    meta.scheduler_id = (uint8_t)g_selected_scheduler;
++    meta.scheduler_id = RR_SCHEDULER_ID;
+ 
+     {
+         std::lock_guard<std::mutex> lk(g_gps_mtx);
+@@ -452,51 +385,24 @@
+ void dispatchQuicPacket(uint8_t* data, size_t len,
+                         struct sockaddr_storage* peer_addr,
+                         struct sockaddr_storage* local_addr) {
++    (void)local_addr;
++
+     struct sockaddr_in* peer_sin = (struct sockaddr_in*)peer_addr;
+     struct sockaddr_in* pc5_sin  = (struct sockaddr_in*)&pc5_remote_addr;
+     bool is_pc5 = (peer_sin->sin_addr.s_addr == pc5_sin->sin_addr.s_addr &&
+                    peer_sin->sin_port        == pc5_sin->sin_port);
+-    const char* net_str = is_pc5 ? "PC5" : "UU";
+-
+-    // [DQN] 구간 송신 패킷 수 (경로 무관, delivery_ratio 분모)
+-    g_win_sent.fetch_add(1);
+ 
+     if (is_pc5) {
+-            g_tx_pkt_pc5++;
+-            g_tx_byte_pc5.fetch_add(len);           // [터미널]
+-            g_last_tx_pc5_us.store(now_us());       // [터미널]
+-            int d = g_pc5_delay_us.load();
+-            if (d > 0) usleep(d);                       // ← 이것만
+-            int sr = Seamless_SendPc5Raw(data, (uint16_t)len);
+-            (void)sr;
+-    } else {
+-        if (!g_uu_killed.load() && g_uu_sock >= 0){
+-            g_tx_pkt_uu++;
+-            g_tx_byte_uu.fetch_add(len);                // [터미널]
+-            g_last_tx_uu_us.store(now_us());            // [터미널]
+-            sendto(g_uu_sock, data, len, 0,
+-                (struct sockaddr*)peer_addr, sizeof(struct sockaddr_in));
+-            }
+-    }
+-
+-    // ── DQN 로깅: 패킷 하나 나갈 때마다 한 줄 ──
+-    GpsSnapshot gps;
+-    { std::lock_guard<std::mutex> lk(g_gps_mtx); gps = g_gps_snap; }
+-
+-    std::lock_guard<std::mutex> lk(g_dqn_csv_mtx);
+-    if (g_dqn_csv) {
+-        fprintf(g_dqn_csv, "%llu,%llu,%llu,%.7f,%.7f,%.2f,%.1f,%d,%d,%s,%u\n",
+-            (unsigned long long)g_dispatch_seq.fetch_add(1),
+-            (unsigned long long)g_current_frame_id.load(),
+-            (unsigned long long)now_us(),
+-            gps.lat, gps.lon,
+-            gps.speed_mps * 3.6f,
+-            gps.heading_deg,
+-            g_uu_rssi_snapshot.load(),
+-            g_pc5_rssi_snapshot.load(),
+-            net_str,
+-            (unsigned)len);
+-        fflush(g_dqn_csv);
++        g_tx_pkt_pc5++;
++        g_tx_byte_pc5.fetch_add(len);
++        g_last_tx_pc5_us.store(now_us());
++        (void)Seamless_SendPc5Raw(data, (uint16_t)len);
++    } else if (g_uu_sock >= 0) {
++        g_tx_pkt_uu++;
++        g_tx_byte_uu.fetch_add(len);
++        g_last_tx_uu_us.store(now_us());
++        (void)sendto(g_uu_sock, data, len, 0,
++                     (struct sockaddr*)peer_addr, sizeof(struct sockaddr_in));
+     }
+ }
+ 
+@@ -587,7 +493,7 @@
+ picoquic_quic_t* initQuic(){
+     uint64_t t = picoquic_current_time();
+     picoquic_quic_t *quic = picoquic_create(
+-        8, "certs/cert.pem", "certs/key.pem", NULL, "v2x_test",
++        8, "../certs/cert.pem", "../certs/key.pem", NULL, "v2x_test",
+         NULL, NULL, NULL, NULL, NULL, t, NULL, NULL, NULL, 0);
+     if (!quic) return nullptr;
+     quic->default_multipath_option = 1;
+@@ -646,10 +552,6 @@
+             UI_BAD("PC5 경로 삭제 (path ID 소모됨)");
+             g_pc5_path_added = false;
+             g_pc5_need_probe = true;
+-            // stream8 은 redundant 모드에서만 쓴다. RESET_STREAM 은
+-            // 되돌릴 수 없으므로 그 모드일 때만 건드린다.
+-            if (scheduler_is_redundant())
+-                picoquic_reset_stream(cnx, 8, 0);
+             break;
+         case picoquic_callback_close:
+         case picoquic_callback_application_close:
+@@ -678,33 +580,13 @@
+     return quic;
+ }
+ 
+-// ── 경로 상태 폴링 + 유휴 경로 keepalive ─────────────────────
+-//
+-//   draft-ietf-quic-multipath-21 §5.9:
+-//     "If a path is not actively used for a while, it might not be
+-//      usable anymore, e.g., due to middlebox timeouts. To avoid such
+-//      path breakage, endpoints can send ack-eliciting packets ... on
+-//      that path to keep it alive. ... This process can be applied to
+-//      each path separately."
+-//
+-//   구현: scheduler_request_keepalive(rat) 로 다음 패킷 한 개를 유휴
+-//   경로로 강제 전송한다. 그 패킷은 ack-eliciting 이므로
+-//     - 미들박스/NAT 바인딩이 갱신되고
+-//     - PATH_ACK 이 돌아와 §5.4 대로 진짜 RTT 표본이 생기며
+-//     - 응답이 없으면 picoquic 의 PTO/demotion 이 알아서 작동한다
+-//   즉 생존 판정을 우리가 흉내내지 않고 picoquic 에게 재료만 준다.
+-//
+-//   경로가 이미 demote 되면 강제 턴은 무시되므로(스케줄러가 사용
+-//   불가 경로를 거른다) 죽은 경로에 패킷을 계속 흘리지 않는다.
+-static const uint64_t KEEPALIVE_INTERVAL_US = 2000000ULL;  // 2초
++// Poll picoquic path state for diagnostics and reprobe decisions.
+ 
+ void pathStatusThread(picoquic_quic_t* quic) {
+     (void)quic;
+     while (keepRunning && !g_uu_handshake_done)
+         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+ 
+-    uint64_t last_ka_check = 0;
+-
+     while (keepRunning) {
+         std::this_thread::sleep_for(std::chrono::milliseconds(200));
+ 
+@@ -715,35 +597,10 @@
+         }
+         {
+             std::lock_guard<std::mutex> lk(g_pinfo_mtx);
+-            g_pinfo_uu = uu; g_pinfo_pc5 = pc5;
++            g_pinfo_uu = uu;
++            g_pinfo_pc5 = pc5;
+         }
+         g_pinfo_at_us.store(now_us());
+-
+-        // ── keepalive: 유휴 + 사용가능 경로에 2초마다 한 패킷 ──
+-        uint64_t now = now_us();
+-        if (now - last_ka_check < 500000ULL) continue;
+-        last_ka_check = now;
+-
+-        int cur = (g_selected_scheduler == SCHEDULER_DQN)
+-                  ? scheduler_get_last_sel_rat() : -1;
+-
+-        auto idle_for = [&](uint64_t last_tx) -> uint64_t {
+-            return (last_tx == 0 || now < last_tx) ? UINT64_MAX : (now - last_tx);
+-        };
+-
+-        // Uu 가 사용 가능한데 오래 안 썼으면 살려둔다
+-        if (uu.usable && cur != 0 &&
+-            idle_for(g_last_tx_uu_us.load()) > KEEPALIVE_INTERVAL_US) {
+-            scheduler_request_keepalive(0);
+-            g_ka_uu.fetch_add(1);
+-        }
+-        // PC5 도 마찬가지 (Uu 로 붙어 있는 동안 PC5 를 살려두면
+-        // 커버리지 복귀를 probe 없이 감지할 수 있다)
+-        else if (pc5.usable && cur != 1 &&
+-                 idle_for(g_last_tx_pc5_us.load()) > KEEPALIVE_INTERVAL_US) {
+-            scheduler_request_keepalive(1);
+-            g_ka_pc5.fetch_add(1);
+-        }
+     }
+ }
+ 
+@@ -754,7 +611,7 @@
+     bool warned_open = false;
+ 
+     while (keepRunning) {
+-        int gret = gps_open("192.168.70.102", "4545", &gpsdata);
++        int gret = gps_open(g_gps_host, g_gps_port, &gpsdata);
+         if (gret != 0) {
+             if (!warned_open) {
+                 UI_WARN("GPS gps_open 실패: %s (code=%d) \u2014 1초마다 재시도",
+@@ -812,7 +669,7 @@
+     // PC5 RSSI 는 "수신한 신호"의 세기라, 상대(RSU)가 그 순간 PC5 로
+     // 아무것도 쏘지 않으면 측정 자체가 안 되어 -95(플로어)가 나온다.
+     // 실제로 PC5 링크가 멀쩡한데도 한두 샘플이 -95 로 튀는 일이 있고,
+-    // 그걸 그대로 DQN 에 넣으면 헛전환이 일어난다.
++    // Keep the raw RSSI snapshot available for diagnostics and reprobe triggering.
+     // → 최근에 유효값을 본 적이 있으면 짧게 직전값을 유지한다.
+     //   HOLD 시간이 지나도 계속 -95 면 그때는 진짜 단절로 본다.
+     static const int      PC5_RSSI_VALID_ABOVE = -90;
+@@ -1058,7 +915,6 @@
+     UiRate uu_rate, pc5_rate, enc_rate;
+     uint64_t prev_pkt_uu = 0, prev_pkt_pc5 = 0, prev_tick_us = 0;    //구간 pkt/s 계산용
+     bool warned_uu_idle = false;
+-    int  last_rat = -1;
+     int  tick = 0;
+ 
+     while (keepRunning && !g_uu_handshake_done)
+@@ -1068,18 +924,6 @@
+         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+         if (!keepRunning) break;
+ 
+-        // ── DQN 경로 전환 감지 (100ms 해상도) ──
+-        if (g_selected_scheduler == SCHEDULER_DQN) {
+-            int r = dqn_current_rat();
+-            if (last_rat >= 0 && r != last_rat) {
+-                UI_SW("DQN 전환  %s \u2192 %s   rssi[uu %d / pc5 %d]",
+-                      last_rat == 0 ? "Uu" : "PC5",
+-                      r        == 0 ? "Uu" : "PC5",
+-                      g_uu_rssi_snapshot.load(), g_pc5_rssi_snapshot.load());
+-            }
+-            last_rat = r;
+-        }
+-
+         if (++tick < 10) continue;          // 1초마다만 블록 출력
+         tick = 0;
+ 
+@@ -1092,13 +936,10 @@
+         { std::lock_guard<std::mutex> lk(g_pinfo_mtx);
+           uu = g_pinfo_uu; pc5 = g_pinfo_pc5; }
+ 
+-        // DQN 이 요청한 경로 vs 스케줄러가 실제로 고른 경로
+-        int req = (g_selected_scheduler == SCHEDULER_DQN) ? dqn_current_rat() : -1;
+         int act = scheduler_get_last_sel_rat();
+ 
+-        // ●ACTIVE 는 "지금 데이터가 흐르는 경로" 하나뿐이다.
+-        // keepalive 만 흐르는 경로는 생존이 확인된 ○standby 로 본다.
+-        // (경로별 tx 시각으로 판정하면 keepalive 주기와 맞물려 깜빡인다)
++        // ACTIVE marks the path most recently selected by round robin.
++        // The other usable path is shown as standby between selections.
+         auto classify = [&](const scheduler_path_info_t& pi,
+                             int this_rat) -> UiPathState {
+             if (!pi.present || !pi.usable) return PS_DEAD;
+@@ -1127,9 +968,9 @@
+         int nb = 0;
+         { std::lock_guard<std::mutex> lk(quic_mutex); if (g_cnx) nb = g_cnx->nb_paths; }
+ 
+-        float spd; bool fix;
++        bool fix;
+         { std::lock_guard<std::mutex> lk(g_gps_mtx);
+-          spd = g_gps_snap.speed_mps; fix = g_gps_snap.fixed; }
++          fix = g_gps_snap.fixed; }
+ 
+         // 1행 — 헤더
+         printf("\n%s %s\u25B6 %s%s   cam %.1ffps  enc %.2fMbps  drop %llu%s\n",
+@@ -1140,14 +981,13 @@
+ 
+         // 2행 — Uu
+         printf("|  Uu  |  %s  |  %4ddBm  |  %5.2fMbps  |  %4.0fpkt/s  |  "
+-            "누적 %6llu pkt  |  tx %s전%s\n",
++            "누적 %6llu pkt  |  tx %s전\n",
+             ui_state(st_uu),
+             g_uu_rssi_snapshot.load(),
+             uu_mbps,
+             pps_uu,
+             (unsigned long long)cur_pkt_uu,
+-            ui_age(tx_uu, now),
+-            g_uu_killed.load() ? "  ✗KILLED" : "");
++            ui_age(tx_uu, now));
+ 
+         // 3행 — PC5
+         printf("|  PC5 |  %s  |  %4ddBm  |  %5.2fMbps  |  %4.0fpkt/s  |  "
+@@ -1159,69 +999,16 @@
+             (unsigned long long)cur_pkt_pc5,
+             ui_age(tx_pc5, now));
+ 
+-        // 4행 — DQN / 경로
+-        uint64_t fb = scheduler_get_fallback_cnt();
+-        if (g_selected_scheduler == SCHEDULER_DQN) {
+-            printf("|  DQN %s\u2192%s%s  |  경로 %d  |  probe %d/%d  |"
+-                   "  KA[Uu %llu PC5 %llu]%s\n",
+-                   req == 1 ? "PC5" : "Uu",
+-                   act == 1 ? "PC5" : act == 0 ? "Uu" : "--",
+-                   (req >= 0 && act >= 0 && req != act) ? "  \u26A0폴백" : "",
+-                   nb, g_probe_ok.load(), g_probe_fail.load(),
+-                   (unsigned long long)g_ka_uu.load(),
+-                   (unsigned long long)g_ka_pc5.load(),
+-                   fb > 0 ? "  \u26A0" : "");
+-        } else {
+-            printf("|  %s  |  경로 %d  |  probe %d/%d  |\n",
+-                   g_scheduler_name, nb,
+-                   g_probe_ok.load(), g_probe_fail.load());
+-        }
++        // 4행 — round-robin path selections
++        uint64_t rr_uu = 0, rr_pc5 = 0;
++        scheduler_get_sel_counts(&rr_uu, &rr_pc5);
++        printf("|  RR  |  paths %d  |  selections Uu %llu / PC5 %llu  |  probe %d/%d  |\n",
++               nb,
++               (unsigned long long)rr_uu,
++               (unsigned long long)rr_pc5,
++               g_probe_ok.load(), g_probe_fail.load());
+         fflush(stdout);
+ 
+-        //  if (g_verbose) {
+-        //         // 5행 — RTT 진단 (srtt 고착 vs standing queue 구분용)
+-        //         //   rtt_min 도 크다        → 초기 샘플 하나에 갇힘
+-        //         //   rtt_min 은 작은데 srtt만 큼 → 실제 큐 적체
+-        //         //   pto 는 경로 demotion 시간(≈3배)의 근거값
+-        //         printf("  %sRTT  Uu[srtt%.0f min%.0f var%.0f pto%.0f retx%llu]  "
+-        //             "PC5[srtt%.0f min%.0f var%.0f pto%.0f retx%llu]  "
+-        //             "PC5 inflight %llu/%llu(%.0f%%)%s\n",
+-        //             cDIM(),
+-        //             uu.smoothed_rtt / 1000.0,  uu.rtt_min / 1000.0,
+-        //             uu.rtt_variant / 1000.0,   uu.retransmit_timer / 1000.0,
+-        //             (unsigned long long)uu.nb_retransmit,
+-        //             pc5.smoothed_rtt / 1000.0, pc5.rtt_min / 1000.0,
+-        //             pc5.rtt_variant / 1000.0,  pc5.retransmit_timer / 1000.0,
+-        //             (unsigned long long)pc5.nb_retransmit,
+-        //             (unsigned long long)pc5.bytes_in_transit,
+-        //             (unsigned long long)pc5.cwin,
+-        //             pc5.cwin ? (100.0 * pc5.bytes_in_transit / pc5.cwin) : 0.0,
+-        //             cRST());
+-
+-        //         // 6행 — 기간 내 샘플 분포. EWMA 에 실제로 들어가는 값은
+-        //         //   avg = sum/nb 이고, srtt 는 그 avg 의 지수평균이다.
+-        //         //   min~max 폭이 곧 그 경로의 실제 지터다.
+-        //         auto fmt_dist = [&](char* buf, size_t n,
+-        //                             const scheduler_path_info_t& pi) {
+-        //             uint64_t cnt = pi.nb_rtt_estimate_in_period;
+-        //             if (cnt == 0) {
+-        //                 snprintf(buf, n, "last %.1f  (기간 비어있음)",
+-        //                         pi.rtt_sample / 1000.0);
+-        //                 return;
+-        //             }
+-        //             double avg = (double)pi.sum_rtt_estimate_in_period / cnt / 1000.0;
+-        //             double lo  = pi.min_rtt_estimate_in_period / 1000.0;
+-        //             double hi  = pi.max_rtt_estimate_in_period / 1000.0;
+-        //             snprintf(buf, n, "n%-4llu avg%6.1f  %.1f~%.1f (폭%.1f)",
+-        //                     (unsigned long long)cnt, avg, lo, hi, hi - lo);
+-        //         };
+-        //         char du[96], dp[96];
+-        //         fmt_dist(du, sizeof(du), uu);
+-        //         fmt_dist(dp, sizeof(dp), pc5);
+-        //         printf("  %sSAMPLE  Uu[%s]\n          PC5[%s]%s\n",
+-        //             cDIM(), du, dp, cRST());
+-        //         fflush(stdout);
+-        // }
+ 
+         if (g_verbose) {
+             auto fmt_rtt = [](char* buf, size_t n,
+@@ -1260,79 +1047,104 @@
+     }
+ }
+ 
++static bool copy_arg(char* dst, size_t dst_len, const char* value)
++{
++    if (dst == nullptr || dst_len == 0 || value == nullptr || strlen(value) >= dst_len) {
++        return false;
++    }
++    snprintf(dst, dst_len, "%s", value);
++    return true;
++}
++
++static void print_usage(const char* prog)
++{
++    fprintf(stderr,
++        "Usage: %s [options]\n"
++        "  --uu-peer IP          Uu receiver/server address\n"
++        "  --uu-port PORT        Uu receiver UDP port\n"
++        "  --pc5-local IP        local PC5 endpoint address\n"
++        "  --pc5-peer IP         remote PC5 endpoint address\n"
++        "  --gps-host HOST       gpsd host (default: 192.168.70.102)\n"
++        "  --gps-port PORT       gpsd port (default: 4545)\n"
++        "  --camera INDEX        V4L2 camera index (default: 0)\n"
++        "  --exp NAME            experiment label\n"
++        "  --verbose, -v         print raw path RTT samples\n"
++        "  --no-color            disable ANSI colors\n",
++        prog);
++}
++
+ // ===================== MAIN =====================
+ int main(int argc, char** argv) {
+     gst_init(&argc, &argv);
+ 
+     g_color = (isatty(1) != 0);
+ 
+-    int selected = SCHEDULER_ROUND_ROBIN;
+-    g_scheduler_name = "rr";
+     for (int i = 1; i < argc; i++) {
+-        if (strcmp(argv[i], "--exp") == 0 && i+1 < argc) { g_exp_name = argv[++i]; continue; }
+-        if (strcmp(argv[i], "--no-color") == 0) { g_color = false; continue; }
+-        if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
+-            g_verbose = true; continue;
++        if (strcmp(argv[i], "--uu-peer") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_uu_receiver_ip, sizeof(g_uu_receiver_ip), argv[++i])) return -1;
++            continue;
++        }
++        if (strcmp(argv[i], "--uu-port") == 0 && i + 1 < argc) {
++            g_uu_receiver_port = atoi(argv[++i]);
++            continue;
++        }
++        if (strcmp(argv[i], "--pc5-local") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_pc5_sender_ip, sizeof(g_pc5_sender_ip), argv[++i])) return -1;
++            continue;
++        }
++        if (strcmp(argv[i], "--pc5-peer") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_pc5_receiver_ip, sizeof(g_pc5_receiver_ip), argv[++i])) return -1;
++            continue;
++        }
++        if (strcmp(argv[i], "--gps-host") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_gps_host, sizeof(g_gps_host), argv[++i])) return -1;
++            continue;
++        }
++        if (strcmp(argv[i], "--gps-port") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_gps_port, sizeof(g_gps_port), argv[++i])) return -1;
++            continue;
++        }
++        if (strcmp(argv[i], "--camera") == 0 && i + 1 < argc) {
++            g_camera_index = atoi(argv[++i]);
++            continue;
++        }
++        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
++            print_usage(argv[0]);
++            return 0;
++        }
++        if (strcmp(argv[i], "--exp") == 0 && i + 1 < argc) {
++            g_exp_name = argv[++i];
++            continue;
++        }
++        if (strcmp(argv[i], "--no-color") == 0) {
++            g_color = false;
++            continue;
+         }
+-        // PC5 단독 생존 검증: N초 후 Uu 송신을 조용히 차단한다.
+-        if (strcmp(argv[i], "--kill-uu") == 0 && i+1 < argc) {
+-            g_kill_uu_after_s = atoi(argv[++i]); continue;
+-        }
+-        // ↓ 여기에 추가
+-        if (strcmp(argv[i], "--pc5-delay") == 0 && i+1 < argc) {
+-            g_pc5_delay_us.store(atoi(argv[++i]) * 1000); continue;
+-        }
+-        // cwin 검사 활성화 (기본 꺼짐 — 원본 동작 유지)
+-        if (strcmp(argv[i], "--cwin-check") == 0) { scheduler_set_cwin_check(1); continue; }
+-        if (strcmp(argv[i], "--scheduler") == 0 && i+1 < argc) {
+-            const char* n = argv[++i];
+-            if      (!strcmp(n,"rr"))         { selected=SCHEDULER_ROUND_ROBIN;  g_scheduler_name="rr"; }
+-            else if (!strcmp(n,"minrtt"))      { selected=SCHEDULER_MIN_RTT;      g_scheduler_name="minrtt"; }
+-            else if (!strcmp(n,"redundant"))   { selected=SCHEDULER_REDUNDANT;    g_scheduler_name="redundant"; }
+-            else if (!strcmp(n,"mprdeadline")) { selected=SCHEDULER_MPR_DEADLINE; g_scheduler_name="mprdeadline"; }
+-            else if (!strcmp(n,"storm"))       { selected=SCHEDULER_STORM;        g_scheduler_name="storm"; }
+-            else if (!strcmp(n,"peekaboo"))    { selected=SCHEDULER_PEEKABOO;     g_scheduler_name="peekaboo"; }
+-            else if (!strcmp(n,"dqn")) { selected=SCHEDULER_DQN; g_scheduler_name="dqn"; }
+-            else { printf("알 수 없는 스케줄러: %s\n", n); return -1; }
++        if (strcmp(argv[i], "--verbose") == 0 || strcmp(argv[i], "-v") == 0) {
++            g_verbose = true;
++            continue;
+         }
++        fprintf(stderr, "Unknown option: %s\n", argv[i]);
++        print_usage(argv[0]);
++        return -1;
+     }
+ 
+-    picoquic_set_scheduler(selected);
+-    g_selected_scheduler = selected;
+-
+     ui_start();
+     ui_rule();
+     printf("  %sV2X MP-QUIC Sender%s                        %sexp=%s  role=OBU%s\n",
+            cBLD(), cRST(), cDIM(), g_exp_name, cRST());
+-    printf("  %s스케줄러 %s   결정주기 500ms   min_hold 2000ms   cc bbr   "
+-           "max_path_id %d   keepalive 2s%s\n",
+-           cDIM(), g_scheduler_name, MAX_PATH_ID, cRST());
+-    printf("  %s카메라 %dx%d@%dfps \u2192 H264 1.0Mbps \u2192 RTP%s\n",
++    printf("  %sscheduler round-robin   cc bbr   max_path_id %d%s\n",
++           cDIM(), MAX_PATH_ID, cRST());
++    printf("  %scamera %dx%d@%dfps -> H264 1.0Mbps -> RTP%s\n",
+            cDIM(), CAMERA_WIDTH, CAMERA_HEIGHT, CAMERA_FPS, cRST());
+-    printf("  %sUu  %s:%d       PC5  %s \u2192 %s%s\n",
++    printf("  %sUu  %s:%d       PC5  %s -> %s%s\n",
+            cDIM(), UU_RECEIVER_IP, UU_RECEIVER_PORT,
+            PC5_SENDER_IP, PC5_RECEIVER_IP, cRST());
+-    printf("  %s종료: q + Enter%s\n", cDIM(), cRST());
++    printf("  %sexit: q + Enter%s\n", cDIM(), cRST());
+     ui_rule();
+ 
+     initAddresses();
+ 
+-    // ── DQN CSV 파일 열기 ──
+-    if (system("mkdir -p ./logs") != 0) {
+-        UI_WARN("logs 디렉토리 생성 실패");
+-    }
+-    {
+-        time_t now = time(nullptr);
+-        struct tm* tm_info = localtime(&now);
+-        char ts[32];
+-        strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm_info);
+-        std::string dqn_path = std::string("./logs/sender_") + g_scheduler_name + "_" + ts + "_dqn.csv";
+-        g_dqn_csv = fopen(dqn_path.c_str(), "w");
+-        if (g_dqn_csv)
+-            fprintf(g_dqn_csv, "seq,frame_id,timestamp_us,lat,lon,speed_kmh,heading_deg,uu_rssi,pc5_rssi,selected_net,pkt_len\n");
+-        printf("  %slog  %s%s\n", cDIM(), dqn_path.c_str(), cRST());
+-    }
+-
+     if (!initSirius(PC5_SENDER_IP)) {
+         UI_BAD("V2X init ERROR");
+         return -1;
+@@ -1353,39 +1165,13 @@
+     std::thread rssi_thr(rssiUpdateThread);
+     std::thread stat_thr(senderStatusThread);
+ 
+-    // ── PC5 단독 생존 검증용 Uu 차단 타이머 ──
+-    std::thread kill_thr;
+-    if (g_kill_uu_after_s > 0) {
+-        UI_WARN("PC5 단독 검증 모드 \u2014 %d초 후 Uu 송신을 차단합니다",
+-                g_kill_uu_after_s);
+-        kill_thr = std::thread([]{
+-            for (int s = 0; s < g_kill_uu_after_s && keepRunning; s++)
+-                std::this_thread::sleep_for(std::chrono::seconds(1));
+-            if (!keepRunning) return;
+-            g_uu_killed.store(true);
+-            UI_BAD("Uu 송신 차단 \u2014 이제부터 PC5 단독 생존을 관찰합니다");
+-        });
+-    }
+-
+-    // ── [DQN] 추론 서버 클라이언트 기동 ──────────────────────
+-    //   dqn_infer.py 가 127.0.0.1:15432 에서 대기하고 있어야 한다.
+-    //   서버가 없어도 sender 는 계속 동작하며 3초마다 재연결을 시도한다.
+-    if (selected == SCHEDULER_DQN) {
+-        DqnConfig cfg;                       // 500ms 주기, 최소 유지 2초
+-        DqnHooks  hooks;
+-        hooks.get_uu_rssi        = []{ return g_uu_rssi_snapshot.load();  };
+-        hooks.get_pc5_rssi       = []{ return g_pc5_rssi_snapshot.load(); };
+-        hooks.get_delivery_ratio = dqn_delivery_ratio;
+-        dqn_start(cfg, hooks, &keepRunning, g_scheduler_name);
+-    }
+-
+     GstElement* pipeline = initGStreamerPipeline();
+     if (!pipeline) return -1;
+     initGStreamerApp(pipeline);
+     std::this_thread::sleep_for(std::chrono::seconds(2));
+ 
+     cv::VideoCapture cap;
+-    cap.open(0, cv::CAP_V4L2);
++    cap.open(g_camera_index, cv::CAP_V4L2);
+     cap.set(cv::CAP_PROP_FOURCC, cv::VideoWriter::fourcc('M','J','P','G'));
+     cap.set(cv::CAP_PROP_FRAME_WIDTH,  CAMERA_WIDTH);
+     cap.set(cv::CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT);
+@@ -1439,19 +1225,14 @@
+     gst_object_unref(pipeline);
+     cap.release();
+ 
+-    // ── [DQN] 클라이언트 종료 (스레드 join 전에 소켓 정리) ──
+-    dqn_stop();
+-
+     input_thr.join(); send_thr.join();
+     uu_thr.join(); pc5_thr.join(); mp_thr.join(); path_thr.join();
+     gps_thr.join();
+     rssi_thr.join();
+     stat_thr.join();
+-    if (kill_thr.joinable()) kill_thr.join();
+ 
+     picoquic_free(quic);
+     if (g_uu_sock >= 0) close(g_uu_sock);
+-    if (g_dqn_csv) fclose(g_dqn_csv);
+     Seamless_FinalizePc5Raw();
+ 
+     // ── 종료 요약 ──
+@@ -1469,13 +1250,11 @@
+     {
+         uint64_t su = 0, sp = 0;
+         scheduler_get_sel_counts(&su, &sp);
+-        printf("  %s경로선택  Uu %llu / PC5 %llu     폴백 %llu회     "
+-               "keepalive Uu %llu / PC5 %llu%s\n",
++        printf("  %sRR selections  Uu %llu / PC5 %llu%s\n",
+                cDIM(),
+-               (unsigned long long)su, (unsigned long long)sp,
+-               (unsigned long long)scheduler_get_fallback_cnt(),
+-               (unsigned long long)g_ka_uu.load(),
+-               (unsigned long long)g_ka_pc5.load(), cRST());
++               (unsigned long long)su,
++               (unsigned long long)sp,
++               cRST());
+     }
+     ui_rule();
+     return 0;

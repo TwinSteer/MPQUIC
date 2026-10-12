@@ -1,0 +1,101 @@
+--- a/receiver/receiver.cpp
++++ b/receiver/receiver.cpp
+@@ -339,10 +339,15 @@
+ #define PKT_TYPE_RTP        0x01
+ #define PKT_TYPE_FRAME_META 0x04
+ 
+-#define PC5_SENDER_IP    "10.254.52.19"   // 이름표. 임의값
+-#define PC5_RECEIVER_IP  "10.254.52.18"   // 이름표. scheduler.c 와 일치
+-#define UU_RECEIVER_IP   "100.73.62.97"
+-#define UU_RECEIVER_PORT 36230
++static char g_pc5_sender_ip[64]   = "10.254.52.19";
++static char g_pc5_receiver_ip[64] = "10.254.52.18";
++static char g_uu_receiver_ip[64]  = "100.73.62.97";
++static int  g_uu_receiver_port    = 36230;
++
++#define PC5_SENDER_IP    g_pc5_sender_ip
++#define PC5_RECEIVER_IP  g_pc5_receiver_ip
++#define UU_RECEIVER_IP   g_uu_receiver_ip
++#define UU_RECEIVER_PORT g_uu_receiver_port
+ 
+ // draft-21 §2.1 initial_max_path_id — sender 와 같은 값이어야 한다.
+ #define MAX_PATH_ID      64
+@@ -696,7 +701,7 @@
+ picoquic_quic_t *initQuic() {
+     uint64_t t = picoquic_current_time();
+     picoquic_quic_t *quic = picoquic_create(
+-        8, "certs/cert.pem", "certs/key.pem", NULL, "v2x_test",
++        8, "../certs/cert.pem", "../certs/key.pem", NULL, "v2x_test",
+         customQuicCallback, NULL, NULL, NULL, NULL,
+         t, NULL, NULL, NULL, 0);
+     if (!quic) return nullptr;
+@@ -1079,21 +1084,64 @@
+     }
+ }
+ 
++static bool copy_arg(char* dst, size_t dst_len, const char* value)
++{
++    if (dst == nullptr || dst_len == 0 || value == nullptr || strlen(value) >= dst_len) {
++        return false;
++    }
++    snprintf(dst, dst_len, "%s", value);
++    return true;
++}
++
++static void print_usage(const char* prog)
++{
++    fprintf(stderr,
++        "Usage: %s [options]\n"
++        "  --uu-bind IP          local Uu/server address\n"
++        "  --uu-port PORT        local Uu UDP port\n"
++        "  --pc5-local IP        local PC5/RSU address\n"
++        "  --pc5-peer IP         remote PC5/OBU address\n"
++        "  --exp NAME            experiment label\n"
++        "  --no-color            disable ANSI colors\n",
++        prog);
++}
++
+ // ===================== MAIN =====================
+ int main(int argc, char **argv) {
+-    initAddresses();
+-
+     g_color = (isatty(1) != 0);
+ 
+-    // ── 실험 이름 파싱 ──────────────────────────────────────
+     std::string exp_name = "default";
+     for (int i = 1; i < argc; i++) {
+-        if (strcmp(argv[i], "--exp") == 0 && i + 1 < argc)
++        if (strcmp(argv[i], "--uu-bind") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_uu_receiver_ip, sizeof(g_uu_receiver_ip), argv[++i])) return -1;
++        }
++        else if (strcmp(argv[i], "--uu-port") == 0 && i + 1 < argc) {
++            g_uu_receiver_port = atoi(argv[++i]);
++        }
++        else if (strcmp(argv[i], "--pc5-local") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_pc5_receiver_ip, sizeof(g_pc5_receiver_ip), argv[++i])) return -1;
++        }
++        else if (strcmp(argv[i], "--pc5-peer") == 0 && i + 1 < argc) {
++            if (!copy_arg(g_pc5_sender_ip, sizeof(g_pc5_sender_ip), argv[++i])) return -1;
++        }
++        else if (strcmp(argv[i], "--exp") == 0 && i + 1 < argc) {
+             exp_name = argv[++i];
+-        else if (strcmp(argv[i], "--no-color") == 0)
++        }
++        else if (strcmp(argv[i], "--no-color") == 0) {
+             g_color = false;
++        }
++        else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
++            print_usage(argv[0]);
++            return 0;
++        }
++        else {
++            fprintf(stderr, "Unknown option: %s\n", argv[i]);
++            print_usage(argv[0]);
++            return -1;
++        }
+     }
+     g_exp_name_disp = exp_name;
++    initAddresses();
+ 
+     // ── CSV 파일 열기 ────────────────────────────────────────
+     std::string base = "./logs/";

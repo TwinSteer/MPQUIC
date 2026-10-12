@@ -1,0 +1,28 @@
+# Build output
+/build/
+**/*.o
+**/*.a
+**/*.so
+**/*.so.*
+
+# Runtime output
+**/logs/
+*.log
+*.qlog
+*.csv
+
+# Local configuration
+/configs/local.env
+
+# Certificates and private keys
+/certs/cert.pem
+/certs/key.pem
+
+# Vendor SDK: keep outside the repository
+/sdk/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+*~

@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the TwinSteer paper and this repository."
+title: "TwinSteer MP-QUIC Reference Implementation"
+type: software
+authors:
+  - name: "TwinSteer Authors"
+repository-code: "https://github.com/TwinSteer/MPQUIC"
+url: "https://github.com/TwinSteer/MPQUIC"
+license: MIT
+version: 0.1.0
+date-released: 2026-10-08
